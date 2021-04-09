@@ -1,0 +1,288 @@
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "project.h"
+#include "AngleCalibration_Header.h"
+#include "Coordinates_Header.h"
+char buffer[1000]; //UART
+int MessageReady = 0;
+
+//====================================================================================================
+//=======================================CORE FUNCTIONS===============================================
+//====================================================================================================
+void MoveServo(int Servo, double Angle){
+    //Shoulder=2, Elbow=3, Wrist=4
+    double Steps;
+    double x,StartCompare,EndCompare;
+    int Delay=20;
+    int TotalSteps=50;
+   
+    if (Servo==2){
+        StartCompare=Shoulder_ReadCompare();
+        EndCompare=GetServoDutyShoulder(Angle);
+        Steps=(EndCompare-StartCompare)/TotalSteps;
+        for (x=0;x<TotalSteps;x++){
+            StartCompare=StartCompare+Steps;
+            Shoulder_WriteCompare(StartCompare);
+            CyDelay(50);
+        }
+        Shoulder_WriteCompare(EndCompare);
+    }
+    else if (Servo==3){
+        StartCompare=Elbow_ReadCompare();
+        EndCompare=GetServoDutyElbow(Angle);
+        if (fabs(StartCompare-EndCompare) < 200){
+            TotalSteps = 10;        
+        }
+        Steps=(EndCompare-StartCompare)/TotalSteps;
+        for (x=0;x<TotalSteps;x++){
+            StartCompare=StartCompare+Steps;
+            Elbow_WriteCompare(StartCompare);  
+            CyDelay(Delay);
+        }
+        Elbow_WriteCompare(EndCompare);
+    }
+    else{
+        EndCompare=GetServoDutyWrist(180-Angle);
+        Wrist_WriteCompare(EndCompare);
+    }
+}
+
+void MoveStepper(double Steps){
+    int Speed = 3000;
+    ENA_Write(0);
+    //Calibrate
+    DIR_Write(0);
+    while (CAL_SWITCH_Read()==1){
+        PULSE_Write(1);
+        CyDelayUs(Speed);
+        PULSE_Write(0);
+        CyDelayUs(Speed);
+    }
+    
+    //Go to Angle
+    DIR_Write(1);
+    PULSE_Write(0);  
+    int x = 0;
+    ENA_Write(0);
+    for (x = 0; x < Steps; x++){
+        PULSE_Write(1);
+        CyDelayUs(Speed);
+        PULSE_Write(0);
+        CyDelayUs(Speed);
+    }
+}
+
+void GripperOpen(){
+    Gripper_WriteCompare(1905);
+    CyDelay(500);
+}
+
+void GripperClose(){
+    Gripper_WriteCompare(1872);
+    CyDelay(500);
+}
+
+int Switch_Debounce_Read(int Switch){
+    int PressedFlag =0;
+    if (Switch==1){
+        if (Input_Button_Read()){
+            CyDelay(15);
+            if (Input_Button_Read()){
+                PressedFlag = 1;      
+            } 
+        }
+    }
+    else if (Switch==2){
+        if (Undo_Button_Read()){
+            CyDelay(15);
+            if (Undo_Button_Read()){
+                PressedFlag = 1;      
+            }  
+        }
+    }
+    else{
+        if (Reset_Button_Read()){
+            CyDelay(15);
+            if (Reset_Button_Read()){
+                PressedFlag = 1;       
+            }
+        }
+    }
+    CyDelay(100);
+    return PressedFlag;   
+}
+
+
+//====================================================================================================
+//========================================INVERSE KINEMATICS==========================================
+//====================================================================================================
+double LawOfCosines(double a,double b,double c){ //https://appliedgo.net/roboticarm/
+    return acos((a*a+b*b-c*c)/(2*a*b))*(180/M_PI);
+}
+
+void GoTo(int Square, double z, int isPickUp){
+    double Magnitude=GetLength(Square);
+    double Stepper_Steps=GetSteps(Square)+8;
+    if (Magnitude>450){
+            return;    
+    }
+    double Beam1=204;
+    double Beam2=246;
+    double Distance=sqrt(Magnitude*Magnitude+z*z);
+    double D1=atan2(z,Magnitude)*(180/M_PI);
+    double D2=LawOfCosines(Distance,Beam1,Beam2);
+    double AngleShoulder=D1+D2;
+    double AngleElbow=LawOfCosines(Beam1,Beam2,Distance);
+    
+    //NEED TO MAKE SURE ANGLE OF ELBOW 0 IS GRIPPER SIDE NOT BASE SIDE
+    MoveServo(2,115);
+    MoveServo(3,45);
+    MoveServo(4,180-(180-AngleElbow-D2)-10); //Move Wrist parallel
+    MoveStepper(Stepper_Steps); //Move Base
+    MoveServo(3,AngleElbow); //Move Elbow
+    MoveServo(2,AngleShoulder); //Lower Angle
+    CyDelay(500);
+}
+//====================================================================================================
+//HIGH LEVEL MOVES
+//====================================================================================================
+void PickUp(int Square){
+    GripperOpen();
+    GoTo(Square,GetHeight(Square),1);
+    GripperClose();
+    MoveServo(2,115);
+}
+
+void PutDown(int Square){
+    GripperClose();
+    GoTo(Square,GetHeight(Square),1);
+    GripperOpen();
+    MoveServo(2,115);
+}
+//====================================================================================================
+//MAIN
+//====================================================================================================
+int main(void)
+{
+    CyGlobalIntEnable;
+    UART_1_Start();
+    Shoulder_Start();
+    Elbow_Start();
+    Wrist_Start();
+    Gripper_Start();
+    UART_1_PutString( " \n===New Process=== \n" );  
+    int i = 0;
+    uint8 IncomingData[5]={-1,-1,-1,-1,-1};
+    uint8 rxData;
+    for(;;)
+    {
+        /*
+        int x = 48;
+        PickUp(x);
+        PutDown(x+8);
+        PickUp(x+8);
+        PutDown(x);
+        CyDelay(1000);
+        */
+      
+        //CHECK FOR BUTTON PRESS
+        int ButtonFlag = 0;
+        while (ButtonFlag == 0){
+            Ready_LED_Write(1);
+            if (Switch_Debounce_Read(1)){ //Input
+                Ready_LED_Write(0);
+                UART_1_WriteTxData(0);
+                UART_1_WriteTxData(0);
+                ButtonFlag = 1;
+            }
+            else if (Switch_Debounce_Read(2)){ //Undo
+                Ready_LED_Write(0);
+                UART_1_WriteTxData(0);
+                UART_1_WriteTxData(1);
+                ButtonFlag = 1;
+            }
+            else if (Switch_Debounce_Read(3)){ //Reset
+                Ready_LED_Write(0);
+                GameOver_LED_Write(0);
+                UART_1_WriteTxData(1);
+                UART_1_WriteTxData(1);
+                ButtonFlag = 1;
+            }
+        }
+        //PC WILL PROCESS THEN SEND DATA BACK TO PSOC
+        
+        while(UART_1_GetRxBufferSize() == 0){ }
+        i = 0;
+        while (UART_1_GetRxBufferSize()){
+            Ready_LED_Write(0);
+            LED_Write(~LED_Read());
+            rxData = UART_1_GetChar();
+            IncomingData[i] = rxData;
+            i = i+1;
+            CyDelay(50);
+            if (i==5){
+                UART_1_ClearRxBuffer();
+                int MoveFromTens = IncomingData[0]-'0';
+                int MoveFromOnes = IncomingData[1]-'0';
+                int MoveToTens = IncomingData[2]-'0';
+                int MoveToOnes = IncomingData[3]-'0';
+                int MoveType = IncomingData[4]-'0';
+                
+                int From = MoveFromTens*10 + MoveFromOnes;
+                int To = MoveToTens*10 + MoveToOnes;
+                
+                From = 63 - From; //Mapping for calibration
+                To = 63 - To;
+        
+                if (MoveType==0){ //Basic Move
+                    LED_Write(1);
+                    PickUp(From);
+                    PutDown(To);
+                    GoTo(-1,40,0);
+                }
+                else if (MoveType == 1){ //Promote (Assumed Queen)
+                    int _ = 0;
+                    PickUp(From);
+                    PutDown(To);
+                    for (_ = 0; _ < 20; _++){
+                        Promote_LED_Write(~Promote_LED_Read());
+                        CyDelay(100); 
+                    }
+                    Promote_LED_Write(0);
+                    GoTo(-1,30,0);
+                }
+                else if (MoveType == 2){ //Castle
+                    if (To>From){ //King Side Castle
+                        PickUp(From);
+                        PutDown(To);
+                        PickUp(63);
+                        PutDown(From-1);
+                    }
+                    else{ //Queen side Castle
+                        PickUp(From);
+                        PutDown(To);
+                        PickUp(56);
+                        PutDown(From+1);
+                    }
+                    GoTo(-1,30,0);
+                }
+                else if (MoveType == 3){ //Eliminate
+                    PickUp(To);
+                    PutDown(-1);
+                    PickUp(From);
+                    PutDown(To);
+                    GoTo(-1,30,0);
+                }
+                else if (MoveType == 4){ //Checkmate
+                    GameOver_LED_Write(1); //Turn Game Over LED on
+                }
+                else{
+                    CyDelay(500); //Do nothing
+                }
+                LED_Write(0);
+            }
+        }
+    
+    }
+}
